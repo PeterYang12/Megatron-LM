@@ -590,11 +590,236 @@ if _CUTE_AVAILABLE:
 
 def _require_cute(message: str, *tensors: Optional[torch.Tensor]) -> None:
     """Raise ``RuntimeError`` when a wrapper cannot use CuTeDSL kernels."""
-    if not _CUTE_AVAILABLE or not all(tensor is None or tensor.is_cuda for tensor in tensors):
+    if not _cute_usable(*tensors):
         raise RuntimeError(message)
 
 
+def _cute_usable(*tensors: Optional[torch.Tensor]) -> bool:
+    """Whether the CuTeDSL kernels can run on these tensors (else the PyTorch fallback runs)."""
+    return (
+        _CUTE_AVAILABLE
+        and torch.version.hip is None
+        and all(tensor is None or tensor.is_cuda for tensor in tensors)
+    )
+
+
 _COMPILED_LAUNCH_CACHE = {}
+
+
+# =============================================================================
+# PyTorch fallback
+# =============================================================================
+# Same contracts as the CuTeDSL kernels above, written with gather/scatter and
+# searchsorted so they run wherever PyTorch runs (ROCm, CPU, CUDA without
+# CuTeDSL). Used automatically when the kernels are unavailable.
+# =============================================================================
+
+
+def _visible_group_spans(
+    cu_seqlens: torch.Tensor, global_start: int, l_local: int, ratio: int, d_comp: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per sequence: start row, first visible compressed group, visible token count, token prefix sum.
+
+    A compressed group is visible to this rank when its tokens lie in
+    ``[global_start - d_comp, global_start + l_local)`` and inside the sequence.
+    """
+    cu = cu_seqlens.to(torch.int64)
+    seq_start, seq_end = cu[:-1], cu[1:]
+    range_start = int(global_start)
+    range_end = range_start + int(l_local)
+    local_seq_end = seq_end.clamp_max(range_end)
+    active = (seq_start < local_seq_end) & (local_seq_end > range_start)
+    first_group = ((range_start - int(d_comp) - seq_start).clamp_min(0) + int(ratio) - 1) // int(
+        ratio
+    )
+    stop_group = (local_seq_end - seq_start) // int(ratio)
+    count = torch.where(active, (stop_group - first_group).clamp_min(0), torch.zeros_like(stop_group))
+    tokens = count * int(ratio)
+    return seq_start, first_group, tokens, torch.cumsum(tokens, dim=0)
+
+
+def _compact_source_rows(
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    l_local: int,
+    ratio: int,
+    d_comp: int,
+    compact_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Global source row (-1 when empty) and compressed group id (-1) of every compact row."""
+    seq_start, first_group, tokens, prefix = _visible_group_spans(
+        cu_seqlens, global_start, l_local, ratio, d_comp
+    )
+    n_seq = seq_start.shape[0]
+    rows = torch.arange(int(compact_len), dtype=torch.int64, device=cu_seqlens.device)
+    seq_idx = torch.searchsorted(prefix, rows, right=True)
+    valid = seq_idx < n_seq
+    seq_idx = seq_idx.clamp_max(max(n_seq - 1, 0))
+    local_token = rows - (prefix[seq_idx] - tokens[seq_idx])
+    comp_id = first_group[seq_idx] + local_token // int(ratio)
+    src_global = seq_start[seq_idx] + comp_id * int(ratio) + local_token % int(ratio)
+    src_global = torch.where(valid, src_global, torch.full_like(src_global, -1))
+    comp_id = torch.where(valid, comp_id, torch.full_like(comp_id, -1))
+    return src_global, comp_id
+
+
+def _compressor_input_compact_torch_forward(
+    ctx,
+    hidden_local: torch.Tensor,
+    boundary_hidden: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    ratio: int,
+    d_comp: int,
+    c_cap: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch forward of ``CompressorInputCompact``: one gather from (boundary | local | zero row)."""
+    l_local = hidden_local.shape[0]
+    d_window = boundary_hidden.shape[0]
+    range_start = int(global_start)
+    compact_len = int(c_cap) * int(ratio)
+    src_global, comp_id = _compact_source_rows(
+        cu_seqlens, global_start, l_local, ratio, d_comp, compact_len
+    )
+    # Row index into cat(boundary, local, zero): boundary rows cover
+    # [range_start - d_window, range_start), local rows [range_start, range_start + l_local).
+    gather = torch.where(
+        src_global < 0,
+        torch.full_like(src_global, d_window + l_local),
+        torch.where(
+            src_global < range_start,
+            src_global - (range_start - d_window),
+            src_global - range_start + d_window,
+        ),
+    )
+    row_width = hidden_local[0].numel() if l_local else boundary_hidden[0].numel()
+    source = torch.cat(
+        (
+            boundary_hidden.reshape(d_window, row_width),
+            hidden_local.reshape(l_local, row_width),
+            hidden_local.new_zeros((1, row_width)),
+        ),
+        dim=0,
+    )
+    hidden_compact = source.index_select(0, gather).reshape(
+        (compact_len,) + tuple(hidden_local.shape[1:])
+    )
+    ctx.save_for_backward(gather)
+    ctx.torch_shapes = (tuple(hidden_local.shape), tuple(boundary_hidden.shape))
+    # One group id per compact group (the kernel writes it from each group's first row).
+    return hidden_compact, comp_id[:: int(ratio)].to(torch.int32)
+
+
+def _compressor_input_compact_torch_backward(ctx, grad_hidden_compact: torch.Tensor):
+    """PyTorch backward of ``CompressorInputCompact``: scatter-add back through the same gather."""
+    (gather,) = ctx.saved_tensors
+    hidden_shape, boundary_shape = ctx.torch_shapes
+    l_local, d_window = hidden_shape[0], boundary_shape[0]
+    grad = grad_hidden_compact.reshape(grad_hidden_compact.shape[0], -1)
+    grad_source = grad.new_zeros((d_window + l_local + 1, grad.shape[1]))
+    grad_source.index_add_(0, gather, grad)
+    grad_hidden = grad_source[d_window : d_window + l_local].reshape(hidden_shape)
+    grad_boundary = grad_source[:d_window].reshape(boundary_shape)
+    return (grad_hidden, grad_boundary, *([None] * 5))
+
+
+def _build_attention_indices_torch(
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    l_local: int,
+    d_window: int,
+    window_size: int,
+    ratio: int,
+    compressed_width: int,
+    compressed_topk: Optional[torch.Tensor],
+    cu_seqlens_compressed: torch.Tensor,
+    seq_to_rank_row: torch.Tensor,
+    for_indexer_loss: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """PyTorch version of ``build_attention_indices`` (same three modes as the kernel)."""
+    device = cu_seqlens.device
+    global_start, l_local = int(global_start), int(l_local)
+    d_window, window_size = int(d_window), int(window_size)
+    ratio, compressed_width = int(ratio), int(compressed_width)
+    total_width = window_size + compressed_width
+    compressed_base = d_window + l_local
+
+    cu = cu_seqlens.to(torch.int64)
+    n_seq = cu.shape[0] - 1
+    rows = torch.arange(l_local, dtype=torch.int64, device=device)
+    global_q = global_start + rows
+    seq_idx = torch.searchsorted(cu[1:], global_q, right=True)
+    found = seq_idx < n_seq
+    seq_idx = seq_idx.clamp_max(max(n_seq - 1, 0))
+    seq_start = cu[seq_idx]
+    found = found & (global_q >= seq_start)
+
+    use_comp = ratio > 1 and compressed_width > 0
+    if use_comp:
+        cu_comp = cu_seqlens_compressed.to(torch.int64)
+        seq_comp_start = cu_comp[seq_idx]
+        seq_comp_len = cu_comp[seq_idx + 1] - seq_comp_start
+    else:
+        seq_comp_start = torch.zeros_like(seq_start)
+        seq_comp_len = torch.zeros_like(seq_start)
+    seq_major_rows = seq_to_rank_row.shape[0]
+    rank_rows = seq_to_rank_row.to(torch.int64)
+
+    def rank_major_of(seq_major_id: torch.Tensor, ok: torch.Tensor):
+        ok = ok & (seq_major_id >= 0) & (seq_major_id < seq_major_rows)
+        if seq_major_rows == 0:
+            return torch.full_like(seq_major_id, -1), ok
+        rank_major = rank_rows[seq_major_id.clamp(0, seq_major_rows - 1)]
+        return rank_major, ok & (rank_major >= 0)
+
+    window_start = torch.maximum(global_q - window_size + 1, seq_start)
+    window_count = global_q - window_start + 1
+    window_cols = torch.arange(window_size, dtype=torch.int64, device=device)
+    window_valid = (window_cols[None, :] < window_count[:, None]) & found[:, None]
+    window_vals = window_start[:, None] + window_cols[None, :] - global_start + d_window
+    topk_idxs = torch.full((l_local, total_width), -1, dtype=torch.int64, device=device)
+
+    if for_indexer_loss:
+        comp = compressed_topk.to(torch.int64)
+        ok = (comp >= 0) & (comp < seq_comp_len[:, None]) & found[:, None]
+        rank_major, ok = rank_major_of(seq_comp_start[:, None] + comp, ok)
+        topk_idxs[:, :compressed_width] = torch.where(ok, compressed_base + rank_major, -1)
+        topk_idxs[:, compressed_width:] = torch.where(window_valid, window_vals, -1)
+        indexer_rank_major = torch.where(ok, rank_major, -1).to(torch.int32)
+        return topk_idxs.to(torch.int32), None, indexer_rank_major
+
+    topk_idxs[:, :window_size] = torch.where(window_valid, window_vals, -1)
+    length = window_count.clone()
+    if use_comp:
+        row_idx = rows[:, None].expand(l_local, compressed_width)
+        if compressed_topk is not None:
+            # Selected top-k: valid entries are packed right after the window entries.
+            comp = compressed_topk.to(torch.int64)
+            ok = (comp >= 0) & (comp < seq_comp_len[:, None]) & found[:, None]
+            rank_major, ok = rank_major_of(seq_comp_start[:, None] + comp, ok)
+            position = window_count[:, None] + torch.cumsum(ok.to(torch.int64), dim=1) - 1
+            topk_idxs[row_idx[ok], position[ok]] = compressed_base + rank_major[ok]
+            length = length + ok.sum(dim=1)
+        else:
+            # All visible compressed rows, in sequence order.
+            comp_cols = torch.arange(compressed_width, dtype=torch.int64, device=device)
+            comp_count = torch.minimum(
+                torch.minimum((global_q - seq_start + 1) // ratio, seq_comp_len),
+                torch.full_like(seq_comp_len, compressed_width),
+            )
+            visible = (comp_cols[None, :] < comp_count[:, None]) & found[:, None]
+            rank_major, ok = rank_major_of(seq_comp_start[:, None] + comp_cols[None, :], visible)
+            vals = torch.where(ok, compressed_base + rank_major, -1)
+            position = window_count[:, None] + comp_cols[None, :]
+            topk_idxs[row_idx[visible], position[visible]] = vals[visible]
+            length = length + torch.where(found, comp_count, torch.zeros_like(comp_count))
+    if total_width > 0:
+        topk_idxs[~found] = -1
+        topk_idxs[~found, 0] = 0
+        length = torch.where(found, length, torch.ones_like(length))
+    else:
+        length = torch.where(found, length, torch.zeros_like(length))
+    return topk_idxs.to(torch.int32), length.to(torch.int32), None
 
 
 def _run_compiled_launch(
@@ -674,12 +899,11 @@ class CompressorInputCompact(torch.autograd.Function):
         c_cap: int,
     ):
         """Compact local and boundary hidden rows into compressor input rows."""
-        _require_cute(
-            "DSv4 CP compressor compaction requires CUDA tensors and CuTeDSL.",
-            hidden_local,
-            boundary_hidden,
-            cu_seqlens,
-        )
+        ctx.use_torch = not _cute_usable(hidden_local, boundary_hidden, cu_seqlens)
+        if ctx.use_torch:
+            return _compressor_input_compact_torch_forward(
+                ctx, hidden_local, boundary_hidden, cu_seqlens, global_start, ratio, d_comp, c_cap
+            )
         l_local = hidden_local.shape[0]
         d_window = boundary_hidden.shape[0]
         ctx.hidden_shape = tuple(hidden_local.shape)
@@ -717,6 +941,8 @@ class CompressorInputCompact(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_hidden_compact: torch.Tensor, _grad_comp_ids: torch.Tensor):
         """Scatter compacted compressor gradients to local and boundary rows."""
+        if ctx.use_torch:
+            return _compressor_input_compact_torch_backward(ctx, grad_hidden_compact)
         (cu_seqlens,) = ctx.saved_tensors
         global_start, l_local, ratio, d_comp, d_window = ctx.compact_args
         grad_hidden_compact = grad_hidden_compact.contiguous()
@@ -782,18 +1008,25 @@ def build_attention_indices(
     """
     if for_indexer_loss and compressed_topk is None:
         raise RuntimeError("DSv4 CP indexer-loss indices require compressed_topk.")
-    _require_cute(
-        "DSv4 CP final indices require CUDA tensors and CuTeDSL.",
-        cu_seqlens,
-        compressed_topk,
-        cu_seqlens_compressed,
-        seq_to_rank_row,
-    )
     global_start, l_local = int(global_start), int(l_local)
     if cu_seqlens_compressed is None:
         cu_seqlens_compressed = cu_seqlens
     if seq_to_rank_row is None:
         seq_to_rank_row = torch.empty((1,), dtype=torch.int32, device=cu_seqlens.device)
+    if not _cute_usable(cu_seqlens, compressed_topk, cu_seqlens_compressed, seq_to_rank_row):
+        return _build_attention_indices_torch(
+            cu_seqlens,
+            global_start,
+            l_local,
+            d_window,
+            window_size,
+            ratio,
+            compressed_width,
+            compressed_topk,
+            cu_seqlens_compressed,
+            seq_to_rank_row,
+            for_indexer_loss,
+        )
 
     total_width = window_size + compressed_width
     topk_idxs = torch.empty((l_local, total_width), dtype=torch.int32, device=cu_seqlens.device)
