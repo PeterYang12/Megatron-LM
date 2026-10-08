@@ -1046,8 +1046,11 @@ class Compressor(MegatronModule):
             return None, cu_seqlens_compressed
 
         # Token-wise projections on the FULL flat input — no boundary issue.
-        kv, _ = self.linear_wkv(x)  # (total, 1, coff * head_dim)
-        score, _ = self.linear_wgate(x)  # (total, 1, coff * head_dim)
+        # Run the compressor GEMMs in high precision (BF16) even under FP8 training, as the
+        # SBHD path does: these weights are BF16 in the reference checkpoint.
+        with get_fp8_disabled_context(self.config):
+            kv, _ = self.linear_wkv(x)  # (total, 1, coff * head_dim)
+            score, _ = self.linear_wgate(x)  # (total, 1, coff * head_dim)
 
         if pre_grouped:
             # Compressor-prep already groups rows as ``[g * ratio, (g + 1) * ratio)``.
