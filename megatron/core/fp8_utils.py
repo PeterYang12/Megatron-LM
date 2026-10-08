@@ -3,6 +3,7 @@
 """Utility functions related to FP8 that are used throughout Megatron core"""
 
 import importlib
+import os
 import weakref
 from contextlib import nullcontext
 from functools import wraps
@@ -584,6 +585,20 @@ if HAVE_TE:
                 fp8_recipe = transformer_engine.common.recipe.Float8BlockScaling(
                     fp8_format=fp8_format
                 )
+                if not config.fp8_blockwise_act_pow2_scale:
+                    # Plain float32 activation scales (amax / 448), as block-scaled FP8 inference
+                    # kernels without DeepGEMM compute them; weights and gradients keep the
+                    # power-of-two grid of the checkpoint. On ROCm the Transformer Engine GEMM
+                    # only selects its generic float-scale kernel through this env var.
+                    if os.environ.get("NVTE_FP8_BLOCK_SCALING_FP32_SCALES") != "1":
+                        raise RuntimeError(
+                            "fp8_blockwise_act_pow2_scale=False requires "
+                            "NVTE_FP8_BLOCK_SCALING_FP32_SCALES=1 in the environment of every rank."
+                        )
+                    QParams = transformer_engine.common.recipe.QParams
+                    fp8_recipe.fp8_quant_fwd_inp = QParams(power_2_scale=False, amax_epsilon=0.0)
+                    fp8_recipe.fp8_quant_fwd_weight = QParams(power_2_scale=True, amax_epsilon=0.0)
+                    fp8_recipe.fp8_quant_bwd_grad = QParams(power_2_scale=True, amax_epsilon=0.0)
             elif config.fp8_recipe == Fp8Recipe.mxfp8:
                 fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
                     fp8_format=fp8_format, fp8_dpa=config.fp8_dot_product_attention

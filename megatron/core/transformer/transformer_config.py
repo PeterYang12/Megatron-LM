@@ -603,6 +603,14 @@ class TransformerConfig(ModelParallelConfig):
     uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only,
     4) 'blockwise' for blockwise scaling recipe, 5) 'custom' for custom quantization recipe."""
 
+    fp8_blockwise_act_pow2_scale: bool = True
+    """With fp8_recipe='blockwise': round the activation scales up to powers of two (DeepGEMM
+    convention). Set False to keep plain float32 activation scales (amax / 448), which is what
+    block-scaled FP8 inference kernels without DeepGEMM use, e.g. vLLM on ROCm; weights and
+    gradients keep power-of-two scales either way. False requires
+    NVTE_FP8_BLOCK_SCALING_FP32_SCALES=1 on ROCm so that Transformer Engine selects the
+    float-scale GEMM kernel."""
+
     fp8_param: bool = False
     """If set, keep the parameters in fp8 precision to save memory. This option must be used
     together with fp8 mode (i.e., TransformerConfig.fp8 is not None). Note that not all parameters
@@ -1721,6 +1729,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
+
+        if not self.fp8_blockwise_act_pow2_scale and self.fp8 and self.fp8_recipe != Fp8Recipe.blockwise:
+            raise ValueError("fp8_blockwise_act_pow2_scale=False only applies to fp8_recipe='blockwise'.")
 
         if self.fp8_output_proj:
             if not self.fp8:
