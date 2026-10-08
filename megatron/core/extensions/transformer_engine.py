@@ -25,6 +25,11 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine_int4_fake_qat import (
     maybe_fake_quantize_int4_weight_tensors,
 )
+from megatron.core.fp8_fake_quant import (
+    fp8_fake_quant_active,
+    maybe_fake_quantize_linear_input,
+    maybe_fake_quantize_linear_weights,
+)
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -953,6 +958,7 @@ class TELinear(te.pytorch.Linear):
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        x = maybe_fake_quantize_linear_input(self, x)
 
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
@@ -964,6 +970,12 @@ class TELinear(te.pytorch.Linear):
         if self.te_return_bias:
             return out
         return out, None
+
+    def _get_weight_tensors(self):
+        """Get the weight tensors of the module."""
+        return maybe_fake_quantize_linear_weights(
+            self, super()._get_weight_tensors(), self.config.delay_wgrad_compute
+        )
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Replicate cross TP/DP."""
@@ -1179,6 +1191,17 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         return _get_should_context_be_quantized_params(
             self.te_quant_params, self.training, is_context_quantized
         )
+
+    def _get_weight_tensors(self):
+        """Get the weight tensors of the module."""
+        if fp8_fake_quant_active(self):
+            # The input of the GEMM is the layernorm output, which only exists inside TE,
+            # so the activation half of the fake quant cannot be applied here.
+            raise RuntimeError(
+                "fp8_fake_quant does not support TELayerNormColumnParallelLinear; build the "
+                "model with an unfused input layernorm."
+            )
+        return super()._get_weight_tensors()
 
     def forward(self, x):
         """Forward."""
@@ -2286,6 +2309,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 None if self.disable_parameter_transpose_cache else self.is_first_microbatch
             )
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+            x = maybe_fake_quantize_linear_input(self, x)
 
             with quant_context:
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
@@ -2301,8 +2325,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
         def _get_weight_tensors(self):
             """Get the weight tensors of the module."""
             weight_tensors = super()._get_weight_tensors()
-            return maybe_fake_quantize_int4_weight_tensors(
+            weight_tensors = maybe_fake_quantize_int4_weight_tensors(
                 self.config, self.delay_wgrad_compute, weight_tensors
+            )
+            return maybe_fake_quantize_linear_weights(
+                self, weight_tensors, self.delay_wgrad_compute
             )
 
         def _encode_extra_state(self, state):

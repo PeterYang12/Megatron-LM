@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp8_fake_quant import fake_quant_kv_latent, fake_quant_weight_blockwise
 from megatron.core.fusions.fused_mla_yarn_rope_apply import (
     fused_mla_rope_inplace,
     fused_mla_rope_out_of_place,
@@ -462,7 +463,16 @@ class DSv4HybridAttention(Attention):
         core_attn_out = core_attn_out.view(
             core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1
         )
-        wo_a_weight = self.linear_o_group_proj.view(
+        _woa = self.linear_o_group_proj
+        if self.config.fp8_fake_quant:
+            # A plain parameter rather than a TE linear, so it is rounded here. Weight only:
+            # an FP8 inference engine dequantizes wo_a and runs this contraction in BF16.
+            _woa = fake_quant_weight_blockwise(
+                _woa,
+                self.config.fp8_fake_quant_weight_block_size,
+                self.config.fp8_fake_quant_weight_pow2_scale,
+            )
+        wo_a_weight = _woa.view(
             self.o_local_groups, self.config.o_lora_rank, -1
         )
         core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
@@ -719,6 +729,11 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             kv, _ = self.linear_kv_proj(kv_projection_input)
             kv = self.kv_layernorm(kv)
+            if self.config.fp8_fake_quant_kv_cache:
+                # The FP8 KV cache rounds the latent after the norm and before RoPE.
+                kv = fake_quant_kv_latent(
+                    kv, self.config.qk_pos_emb_head_dim, self.config.fp8_fake_quant_kv_block_size
+                )
             boundary_kv = None
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]

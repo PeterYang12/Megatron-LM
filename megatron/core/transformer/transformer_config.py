@@ -655,6 +655,48 @@ class TransformerConfig(ModelParallelConfig):
     fp8_multi_head_attention: bool = False
     """When set to True, use the FP8 implementation of Multi Head Attention."""
 
+    ####################
+    # fp8 fake quantization (QAT) related
+    ####################
+    fp8_fake_quant: bool = False
+    """If True, round the weights and inputs of the Transformer Engine linear layers through
+    block-scaled FP8 (E4M3) with a straight-through estimator while the GEMMs keep running in
+    BF16, so that a BF16 training run optimizes the arithmetic of a block-scaled FP8 inference
+    engine (quantization-aware training). Weights get one scale per
+    fp8_fake_quant_weight_block_size square tile, inputs one scale per
+    fp8_fake_quant_act_group_size values. Together with FP8 training (fp8 set) the Transformer
+    Engine linear layers are left to TE and only the DeepSeek-V4 grouped output projection is
+    rounded. Cannot be combined with fp4 training and requires gradient_accumulation_fusion=False
+    and delay_wgrad_compute=False. See megatron/core/fp8_fake_quant.py."""
+
+    fp8_fake_quant_weight_block_size: int = 128
+    """Tile edge of the weight scales under fp8_fake_quant."""
+
+    fp8_fake_quant_weight_pow2_scale: bool = True
+    """Round the weight scales up to a power of two under fp8_fake_quant (the ue8m0 scale format
+    of DeepSeek checkpoints)."""
+
+    fp8_fake_quant_act_group_size: int = 128
+    """Values per activation scale under fp8_fake_quant."""
+
+    fp8_fake_quant_act_pow2_scale: bool = False
+    """Round the activation scales up to a power of two under fp8_fake_quant, as DeepGEMM-style
+    kernels do. False keeps plain float32 scales (vLLM's block-scaled kernels on ROCm)."""
+
+    fp8_fake_quant_kv_cache: bool = False
+    """If True, round the KV latent of DeepSeek-V4 attention (after the KV layernorm, before
+    RoPE; the compressed KV likewise) the way an FP8 KV cache stores it: E4M3 with one
+    power-of-two scale per fp8_fake_quant_kv_block_size NoPE channels, RoPE channels kept in
+    BF16. Independent of fp8_fake_quant."""
+
+    fp8_fake_quant_kv_block_size: int = 64
+    """Channels per KV-cache scale under fp8_fake_quant_kv_cache."""
+
+    fp8_fake_quant_indexer_qk: bool = False
+    """If True, round the DeepSeek-V4 indexer queries and keys through E4M3 with one
+    power-of-two scale per vector, before the Hadamard rotation, as an inference engine that
+    runs the indexer in FP8 does. Independent of fp8_fake_quant."""
+
     tp_only_amax_red: bool = False
     """When set to True, reduce the FP8 AMAX only in the TP or TP-CP domain"""
 
@@ -1740,6 +1782,26 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
                 )
+
+        # FP8 fake quantization validation
+        if self.fp8_fake_quant:
+            if self.fp4:
+                raise ValueError("fp8_fake_quant cannot be combined with fp4 training.")
+            if self.gradient_accumulation_fusion and not self.fp8:
+                raise ValueError(
+                    "fp8_fake_quant requires gradient_accumulation_fusion=False: fused wgrad "
+                    "accumulation mutates attributes on the original weight tensors, which the "
+                    "fake-quantized weights replace."
+                )
+            if self.delay_wgrad_compute and not self.fp8:
+                raise ValueError("fp8_fake_quant requires delay_wgrad_compute=False.")
+            if self.fp8_fake_quant_weight_block_size <= 0 or self.fp8_fake_quant_act_group_size <= 0:
+                raise ValueError(
+                    "fp8_fake_quant_weight_block_size and fp8_fake_quant_act_group_size must be "
+                    "positive."
+                )
+        if self.fp8_fake_quant_kv_cache and self.fp8_fake_quant_kv_block_size <= 0:
+            raise ValueError("fp8_fake_quant_kv_block_size must be positive.")
 
         # FP4 validation
         if self.fp4_param and not self.fp4:

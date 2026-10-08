@@ -8,6 +8,11 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from megatron.core.fp8_fake_quant import (
+    exclude_from_fp8_fake_quant,
+    fake_quant_kv_latent,
+    fake_quant_per_vector,
+)
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
@@ -41,6 +46,18 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
 # ---------------------------------------------------------------------------
+
+
+def _rotate_indexer_activation(x: torch.Tensor, config: TransformerConfig) -> torch.Tensor:
+    """Hadamard-rotate an indexer query or key.
+
+    Under ``fp8_fake_quant_indexer_qk`` the vector is first rounded through FP8 with one
+    power-of-two scale, which is what an inference engine that runs the indexer in FP8
+    does to the unrotated vectors; the rotation is orthogonal, so the index scores agree.
+    """
+    if config.fp8_fake_quant_indexer_qk:
+        x = fake_quant_per_vector(x)
+    return rotate_activation(x)
 
 
 @lru_cache(maxsize=8)
@@ -879,6 +896,9 @@ class Compressor(MegatronModule):
                 parallel_mode="duplicated",
                 name=(name + ".linear_wgate") if name is not None else None,
             )
+        # BF16 in the FP8 checkpoint, so an FP8 inference engine runs them in BF16 too.
+        exclude_from_fp8_fake_quant(self.linear_wkv)
+        exclude_from_fp8_fake_quant(self.linear_wgate)
 
         # keep to high precision (FP32 in the reference DeepSeek V4 checkpoint)
         _ape = torch.empty(
@@ -963,7 +983,7 @@ class Compressor(MegatronModule):
             score = self._overlap_transform(score, fill_value=float("-inf"))
         weights = torch.softmax(score, dim=1, dtype=torch.float32).to(kv.dtype)
         kv = (kv * weights).sum(dim=1)  # [n_compressed, b, head_dim]
-        kv = self.norm(kv.to(x.dtype))
+        kv = self._fake_quant_compressed_kv(self.norm(kv.to(x.dtype)))
         kv = _apply_rope(
             kv,
             self.head_dim - self.qk_pos_emb_head_dim,
@@ -976,7 +996,19 @@ class Compressor(MegatronModule):
         )
 
         if self.rotate:
-            kv = rotate_activation(kv)
+            kv = _rotate_indexer_activation(kv, self.config)
+        return kv
+
+    def _fake_quant_compressed_kv(self, kv: torch.Tensor) -> torch.Tensor:
+        """Round the compressed KV the way the FP8 KV cache stores it (fp8_fake_quant_kv_cache).
+
+        The indexer's own compressor (``rotate=True``) produces indexer keys instead, which
+        are rounded per vector in ``_rotate_indexer_activation``.
+        """
+        if self.config.fp8_fake_quant_kv_cache and not self.rotate:
+            kv = fake_quant_kv_latent(
+                kv, self.qk_pos_emb_head_dim, self.config.fp8_fake_quant_kv_block_size
+            )
         return kv
 
     def _forward_thd(
@@ -1094,7 +1126,7 @@ class Compressor(MegatronModule):
         weights = torch.softmax(score_grouped, dim=1, dtype=torch.float32).to(kv_grouped.dtype)
         compressed_thd = (kv_grouped * weights).sum(dim=1)
 
-        compressed_thd = self.norm(compressed_thd.to(dtype))
+        compressed_thd = self._fake_quant_compressed_kv(self.norm(compressed_thd.to(dtype)))
 
         if pre_grouped:
             position_ids = compressed_group_ids[:total_comp].clamp_min(0) * ratio
@@ -1141,7 +1173,7 @@ class Compressor(MegatronModule):
             )
 
         if self.rotate:
-            compressed_thd = rotate_activation(compressed_thd)
+            compressed_thd = _rotate_indexer_activation(compressed_thd, self.config)
         return compressed_thd, cu_seqlens_compressed
 
     def forward(
@@ -1275,6 +1307,7 @@ class CSAIndexer(MegatronModule):
                 parallel_mode="duplicated",
                 name=(name + ".linear_weights_proj") if name is not None else None,
             )
+        exclude_from_fp8_fake_quant(self.linear_weights_proj)
 
         # Own compressor (smaller head_dim, with Hadamard rotation)
         self.compressor = build_module(
@@ -1352,7 +1385,7 @@ class CSAIndexer(MegatronModule):
             cu_seqlens=cu_seqlens_q,
             max_seqlen_rope=max_seqlen_rope,
         )
-        q = rotate_activation(q)
+        q = _rotate_indexer_activation(q, self.config)
 
         # K path: own compressor. SBHD returns ``k``; THD returns the
         # 2-tuple ``(k_thd, cu_seqlens_compressed)``.
@@ -2399,7 +2432,7 @@ class CompressedSparseAttention(MegatronModule):
                         global_start,
                         self.config,
                     )
-                q_indexer_cp = rotate_activation(q_indexer_cp)
+                q_indexer_cp = _rotate_indexer_activation(q_indexer_cp, self.config)
                 weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
                 weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
 
