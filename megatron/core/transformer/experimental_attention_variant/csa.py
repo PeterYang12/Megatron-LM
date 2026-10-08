@@ -610,10 +610,11 @@ def unfused_compressed_sparse_attn(
     rows, np_, hn = q_flat.shape
 
     safe_indices = global_indices.clamp(min=0).long()
-    safe_indices_exp = safe_indices.unsqueeze(-1).expand(-1, -1, hn)
-    kv_gathered = torch.gather(
-        kv_flat.unsqueeze(0).expand(rows, -1, -1), dim=1, index=safe_indices_exp
-    )  # (rows, topk, hn)
+    # Index the flat KV table directly. Gathering from a (rows, n_kv, hn) expanded view
+    # makes the gather backward materialise that whole shape (quadratic in sequence
+    # length) before reducing the stride-0 row dimension; index_select accumulates its
+    # gradient into the compact table instead. Same values, same gradient.
+    kv_gathered = kv_flat.index_select(0, safe_indices.reshape(-1)).view(rows, -1, hn)  # (rows, topk, hn)
 
     q_f = q_flat.float()
     kv_g = kv_gathered.float()
